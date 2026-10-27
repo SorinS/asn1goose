@@ -1,6 +1,9 @@
 // asn1: reading and writing ASN.1 in DER (X.690), strictly: definite,
 // minimal lengths, minimal integers and identifiers, DER's booleans and
-// bit strings, and the time and string forms RFC 5280 allows. A parse
+// bit strings, and the time and string forms RFC 5280 allows. The readers
+// that take `ber` read BER as LDAP (RFC 4511 §5.1) has it instead: lengths
+// in more octets than they need, any nonzero boolean, integers with
+// redundant leading octets; still only definite lengths. A parse
 // never copies: an element is a Tlv of offsets into the caller's buffer,
 // and the typed readers decode its content when asked. Also PEM (RFC 7468)
 // and a dump in the style of `openssl asn1parse`.
@@ -50,7 +53,7 @@ struct Tlv { tag: u32, cls: u8, constructed: bool, number: u32, start: i64, off:
 fn content_len(t: Tlv) -> i64 { t.end - t.off }
 
 // Reads the element at `at`, which must end by `limit`.
-fn read(buf: const u8[:], at: i64, limit: i64) -> Tlv, bool {
+fn read(buf: const u8[:], at: i64, limit: i64, ber: bool = false) -> Tlv, bool {
     var t = Tlv { tag: 0, cls: 0, constructed: false, number: 0, start: at, off: at, end: at };
     if at < 0 || limit > buf.len || at + 2 > limit { return t, false; }
     let id = buf[at];
@@ -85,10 +88,14 @@ fn read(buf: const u8[:], at: i64, limit: i64) -> Tlv, bool {
     } else {
         let nb: i64 = l0 & 0x7f;
         // 0x80 is BER's indefinite length; DER uses the fewest octets.
-        if nb == 0 || nb > 4 || p + nb > limit || buf[p] == 0 { return t, false; }
-        for i in nb { len = (len << 8) | buf[p + i]; }
+        if nb == 0 || p + nb > limit { return t, false; }
+        if !ber && (nb > 4 || buf[p] == 0) { return t, false; }
+        for i in nb {
+            if len > 0x7fffffff { return t, false; }
+            len = (len << 8) | buf[p + i];
+        }
         p += nb;
-        if len < 128 { return t, false; }
+        if !ber && len < 128 { return t, false; }
     }
     if len > limit - p { return t, false; }
     t.off = p;
@@ -97,18 +104,18 @@ fn read(buf: const u8[:], at: i64, limit: i64) -> Tlv, bool {
 }
 
 // The one element that makes up all of buf.
-fn parse(buf: const u8[:]) -> Tlv, bool {
-    let t, ok = read(buf, 0, buf.len);
+fn parse(buf: const u8[:], ber: bool = false) -> Tlv, bool {
+    let t, ok = read(buf, 0, buf.len, ber);
     return t, ok && t.end == buf.len;
 }
 
 // The elements inside a constructed one, which must fill it exactly.
-fn children(buf: const u8[:], t: Tlv) -> Tlv[>..], bool {
+fn children(buf: const u8[:], t: Tlv, ber: bool = false) -> Tlv[>..], bool {
     var out: Tlv[>..] = [];
     if !t.constructed { return out, false; }
     var p = t.off;
     while p < t.end {
-        let c, ok = read(buf, p, t.end);
+        let c, ok = read(buf, p, t.end, ber);
         if !ok { out.clear(); return out, false; }
         out.push(c);
         p = c.end;
@@ -117,25 +124,27 @@ fn children(buf: const u8[:], t: Tlv) -> Tlv[>..], bool {
 }
 
 // The children of a constructed element of a given tag.
-fn children_of(buf: const u8[:], t: Tlv, tag: u32) -> Tlv[>..], bool {
-    var out, ok = children(buf, t);
+fn children_of(buf: const u8[:], t: Tlv, tag: u32, ber: bool = false) -> Tlv[>..], bool {
+    var out, ok = children(buf, t, ber);
     if t.tag != tag { out.clear(); return out, false; }
     return out, ok;
 }
 
 // The single element inside an EXPLICIT tag.
-fn explicit(buf: const u8[:], t: Tlv) -> Tlv, bool {
-    let cs, ok = children(buf, t);
+fn explicit(buf: const u8[:], t: Tlv, ber: bool = false) -> Tlv, bool {
+    let cs, ok = children(buf, t, ber);
     if !ok || cs.len != 1 { return t, false; }
     return cs[0], true;
 }
 
 fn is_tag(t: Tlv, tag: u32) -> bool { t.tag == tag }
 
-// BOOLEAN: DER allows only 0x00 and 0xff.
-fn read_bool(buf: const u8[:], t: Tlv) -> bool, bool {
-    if t.tag != BOOLEAN || content_len(t) != 1 { return false, false; }
+// BOOLEAN: DER allows only 0x00 and 0xff, BER any nonzero octet for true.
+// tag is for an IMPLICIT one.
+fn read_bool(buf: const u8[:], t: Tlv, ber: bool = false, tag: u32 = BOOLEAN) -> bool, bool {
+    if t.tag != tag || content_len(t) != 1 { return false, false; }
     let v = buf[t.off];
+    if ber { return v != 0, true; }
     return v == 0xff, v == 0 || v == 0xff;
 }
 
@@ -152,10 +161,18 @@ fn int_minimal(buf: const u8[:], t: Tlv) -> bool {
 }
 
 // INTEGER (or ENUMERATED, with that tag) as an i64.
-fn read_i64(buf: const u8[:], t: Tlv, tag: u32 = INTEGER) -> i64, bool {
-    if t.tag != tag || !int_minimal(buf, t) || content_len(t) > 8 { return 0, false; }
-    var v: i64 = if buf[t.off] >= 0x80 { -1 } else { 0 };
-    for i in t.off..t.end { v = (v << 8) | buf[i]; }
+fn read_i64(buf: const u8[:], t: Tlv, tag: u32 = INTEGER, ber: bool = false) -> i64, bool {
+    if t.tag != tag || content_len(t) == 0 { return 0, false; }
+    var from = t.off;
+    if ber {
+        // Leading octets that only repeat the sign.
+        while t.end - from > 1 && ((buf[from] == 0 && buf[from + 1] < 0x80) || (buf[from] == 0xff && buf[from + 1] >= 0x80)) { from++; }
+    } else if !int_minimal(buf, t) {
+        return 0, false;
+    }
+    if t.end - from > 8 { return 0, false; }
+    var v: i64 = if buf[from] >= 0x80 { -1 } else { 0 };
+    for i in from..t.end { v = (v << 8) | buf[i]; }
     return v, true;
 }
 

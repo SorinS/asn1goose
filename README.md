@@ -33,6 +33,13 @@ The reader refuses BER: indefinite lengths, lengths longer than needed,
 lengths past the parent, trailing bytes, and high tag numbers that are
 padded or below 31.
 
+For a protocol that sends BER, as LDAP does (RFC 4511 §5.1), `read`,
+`parse`, `children`, `children_of`, `explicit`, `read_bool` and
+`read_i64` take `ber = true`: lengths in more octets than they need
+(Active Directory's `84 00 00 00 nn`), any nonzero BOOLEAN as true,
+integers with redundant leading octets. Lengths stay definite, and
+`read_bool(buf, t, true, tag)` reads an IMPLICIT one.
+
 | Reader | Gives | Refuses |
 |---|---|---|
 | `read_bool` | `bool` | anything but 00 and ff |
@@ -86,3 +93,6 @@ python3 scripts/gen_vectors.py          # regenerate vectors/der.txt with openss
 - `der_reject`: BER framing, non-minimal identifiers, integers and OIDs,
   bad booleans and bit strings, impossible times, strings outside their
   sets, the writer's edge values, and PEM errors.
+- `ber`: the same kinds of BER read with `ber`, and refused without it;
+  indefinite lengths, lengths past the end and trailing bytes refused
+  either way.
