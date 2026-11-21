@@ -6,7 +6,7 @@ It is the base of [x509](https://github.com/SorinS/x509goose), and works as well
 CSRs, CMS or anything else in DER.
 
 ```goose
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 
 let ders, ok = asn1::pem_decode(text, "CERTIFICATE");
 for der in ders {
